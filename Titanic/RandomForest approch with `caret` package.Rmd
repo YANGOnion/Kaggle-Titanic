@@ -1,0 +1,130 @@
+---
+title: "RandomForest approch with `caret` package and parallel training"
+author: "onion"
+date: "20170401"
+output: html_document
+---
+
+> ## Introduction
+> * Data cleaning
+> * Data exploration
+> * Data slicing
+> * Model fitting
+> * Making submission 
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,message=FALSE,warning=F)
+```
+
+## 1.Data cleaning: loading data and imputing
+
+First load the data and implement packages. Here I use `data.table` to manipulate the data. Combine train set and test set as a single full set.
+```{r}
+library(caret)
+library(data.table)
+library(ggplot2)
+library(doParallel)
+data=rbind(fread("data/train.csv"),fread("data/test.csv"),fill=T)
+```
+
+
+Then let's find out the missing data. We calculate the number of `NA` in each column and also, noting that some character variables with some records equal to "", we should take them into consideration too.
+
+```{r}
+colSums(sapply(data,is.na))
+sapply(data,FUN = function(x) length(which(x=="")))
+```
+
+The "Embarked" is related to "Pclass" and "Fare", therefore the missing "Embarked" might be "C" according to the boxplot of "Fare" by Pclass groups. 
+
+```{r}
+ggplot(data,aes(x=Pclass,y=Fare,group=Pclass,fill=as.factor(Pclass)))+geom_boxplot()
+data[Embarked==""]
+data[Embarked=="",Embarked:="C"]
+```
+
+The missing "Fare" can be imputed by the mean of records with same "Embarked" and "Pclass". 
+
+```{r}
+data[is.na(Fare),Fare:=data[Pclass==data[is.na(Fare),Pclass]&&Embarked==data[is.na(Fare),Embarked],mean(Fare,na.rm=T)]]
+```
+
+As for "Age", the information hide within the title in "Name", such as "Mr.", "Mrs.". We infer "Age" by the mean of people with same title.
+
+```{r}
+getTitle=function(s){
+  reg=sapply(s,FUN = function(x) return(gregexpr("\\s\\S+\\.",x)))
+  return(sapply(1:length(s),FUN=function(x) substr(s[x],reg[x][[1]]+1,reg[x][[1]]+attr(reg[x][[1]],"match.length")-1)))
+}
+data[,`:=`(Title=getTitle(Name))]
+data[,gpAge:=mean(Age,na.rm=T),by=Title]
+data[is.na(Age),Age:=gpAge,]
+```
+
+## 2.Data exploration: feature engineering
+
+There exists a surviving penalty for adults according to the density plot. We create new variable "Child" which contains 0 for adults and 1 for children. Sum up "SibSp" and "Parch" to create a variable describing the family size. Then transform categories variables to factors.
+
+```{r}
+ggplot(data=data[!is.na(Survived)],aes(x=Age,colour=as.factor(Survived)))+geom_density()
+table(data[(!is.na(Survived))][Age<18,Survived])
+table(data[(!is.na(Survived))][Age>=18,Survived])
+data[,`:=`(FamilySize=SibSp+Parch+1,Child=rep(0,.N))]
+data[Age<18,Child:=1]
+data[,c("Survived","Pclass","Sex","Embarked","Child")]=lapply(data[,c("Survived","Pclass","Sex","Embarked","Title","Child")], function(x) as.factor(x))
+```
+
+## 3.Data slicing
+
+In order to choose the best model, we divide the train set into two sets: `training` for training the model and `testing` for validating. The proportion of records in `training` is 75%.
+
+```{r}
+train=data[!is.na(Survived)]
+test=data[is.na(Survived)]
+set.seed(1)
+inTrain=createDataPartition(y=train[,Survived],p=0.75,list=FALSE)
+training=train[inTrain,]
+testing=train[-inTrain,]
+```
+
+## 4.Model fitting
+
+We choose randomForest as the model. For faster training, we use `doParallel` package to accelerate the computing by multicores.
+
+```{r}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(allowParallel = TRUE)
+set.seed(1)
+modelFit=train(Survived~Pclass+Sex+Age+SibSp+Parch+Fare+Embarked+FamilySize+Child,
+               method="rf",data=training,trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+modelFit
+```
+
+How about the performance in `testing`?
+
+```{r}
+confusionMatrix(testing$Survived,predict(modelFit,testing))
+```
+
+## 5.Making submission
+
+```{r}
+cluster <- makeCluster(detectCores() - 1)
+registerDoParallel(cluster)
+fitControl <- trainControl(allowParallel = TRUE)
+set.seed(1)
+modelFit=train(Survived~Pclass+Sex+Age+SibSp+Parch+Fare+Embarked+FamilySize+Child,
+               method="rf",data=train,trControl = fitControl)
+stopCluster(cluster)
+registerDoSEQ()
+# write submission file
+submit=test[,.(PassengerId)]
+submit[,`:=`(Survived=predict(modelFit,test))]
+```
+
+
